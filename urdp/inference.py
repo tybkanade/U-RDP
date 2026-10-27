@@ -27,13 +27,12 @@ class FoldPredictor:
         enc = build_intra_encoder(cfg)
         enc.load_state_dict(torch.load(os.path.join(fold_dir, "stage1_intra.pth"), map_location="cpu")["encoder"])
         self.encoder = freeze(enc.to(device))
-        self.model = URDP.from_fold(cfg.model, fold_dir, upto=5, device=device)
+        self.model = URDP.from_fold(cfg.model, fold_dir, upto=5, device=device, tag=cfg.train.run_tag)
 
     @torch.no_grad()
     def predict(self, ds: URDPDataset, batch_size: int = 8, num_workers: int = 0, seed: int = 0) -> Dict:
         ds.set_ct_stats(self.ct_stats["mean"], self.ct_stats["std"])
-        ds.load_ct, ds.load_post = True, False
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate)
+        loader = DataLoader(ds.view(load_ct=True, load_post=False), batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate)
         gen = make_generator(self.device, seed)
         probs, unc, idx = [], [], []
         for batch in tqdm(loader, leave=False):

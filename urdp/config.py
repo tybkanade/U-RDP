@@ -64,6 +64,8 @@ class ModelConfig:
     cpd_ffn: int = 4096
     cpd_dropout: float = 0.2
     cpd_time_dim: int = 256
+    # 生成目标："residual"（U-RDP：r = z_post - z_anchor）| "full"（消融：直接生成 z_post，不用 Anchor）
+    generation_target: str = "residual"
     # Multi-sampling + GU-Gate
     K: int = 6
     # CMAA (Eq.10-12)
@@ -89,6 +91,12 @@ class TrainConfig:
     batch_size_pretrain: int = 8    # 阶段一（原始影像）
     batch_size: int = 32            # 阶段二至五（缓存特征）
     grad_clip: float = 1.0
+    # 阶段 2/3 每个 epoch 在测试折上保存生成嵌入（Fig.4 UMAP、Fig.6 MMD 用）
+    track_embeddings: bool = False
+    # 阶段 5 输出文件后缀（如 CMAA 深度敏感性实验 "L4"），不同 tag 共用阶段 1-4 结果
+    run_tag: str = ""
+    # 读取阶段 1 缓存特征的目录（默认 log_dir）；消融实验可指向主实验目录以复用同一套冻结编码器
+    features_dir: str = ""
 
 
 @dataclass

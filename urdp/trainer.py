@@ -15,15 +15,15 @@ from typing import Dict, Iterable
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from urdp.config import Config
-from urdp.data import URDPDataset, cat_cardinalities, collate, compute_ct_stats, load_or_create_splits
+from urdp.data import DatasetView, URDPDataset, cat_cardinalities, collate, compute_ct_stats, load_or_create_splits
 from urdp.losses import FocalLoss
 from urdp.metrics import KEYS, classification_metrics, fmt, format_cm, mean_std, print_mean_std
 from urdp.models.encoders import IntraEncoder, MLPHead, PostEncoder
-from urdp.models.framework import CKPT_NAMES, STAGE_MODULES, URDP
+from urdp.models.framework import STAGE_MODULES, URDP, ckpt_name
 from urdp.utils import BestKeeper, freeze, load_json, make_generator, make_optimizer, save_json, set_seed
 
 SPLITS = ("train", "val", "test")
@@ -69,7 +69,8 @@ class Trainer:
     @property
     def dataset(self) -> URDPDataset:
         if self._ds is None:
-            self._ds = URDPDataset(self.cfg.data, with_labels=True)
+            # 训练队列要求四模态齐全：阶段 1-5 共用同一批患者与同一份划分
+            self._ds = URDPDataset(self.cfg.data, with_labels=True, require_post=True)
         return self._ds
 
     @property
@@ -85,8 +86,11 @@ class Trainer:
         return d
 
     def run(self, stages: Iterable[int], folds: Iterable[int]):
-        self.cfg.save(os.path.join(self.log_dir, "config.yaml"))
+        self.cfg.save(os.path.join(self.log_dir, f"config{self._sfx}.yaml"))
         stages = sorted(set(stages))
+        if 2 in stages and not URDP.stages_needed(self.cfg.model, 2):
+            print("[info] generation_target=full：跳过阶段 2（不使用 Anchor）")
+            stages.remove(2)
         for fold in folds:
             for stage in stages:
                 print(f"\n========== fold {fold} | stage {stage} ==========")
@@ -102,9 +106,7 @@ class Trainer:
     # 阶段一
     # ==================================================================
     def _loader(self, idx, shuffle: bool, load_ct: bool, load_post: bool, bs: int = None) -> DataLoader:
-        ds = self.dataset
-        ds.load_ct, ds.load_post = load_ct, load_post
-        return DataLoader(Subset(ds, idx), batch_size=bs or self.cfg.train.batch_size_pretrain, shuffle=shuffle,
+        return DataLoader(DatasetView(self.dataset, load_ct, load_post, idx), batch_size=bs or self.cfg.train.batch_size_pretrain, shuffle=shuffle,
                           num_workers=self.cfg.train.num_workers, pin_memory=True, collate_fn=collate)
 
     def _run_epoch(self, model, loader, crit, opt=None) -> Dict:
@@ -160,7 +162,7 @@ class Trainer:
         post.load_state_dict(torch.load(os.path.join(out, "stage1_post.pth"), map_location="cpu")["encoder"])
         intra, post = freeze(intra.to(self.device)), freeze(post.to(self.device))
 
-        loader = self._loader(list(range(len(self.dataset))), False, True, True)
+        loader = self._loader(None, False, True, True)
         feats = {k: [] for k in ("z_ct", "z_fs", "z_tab", "z_post", "y")}
         for batch in tqdm(loader, desc="cache features"):
             for k, v in intra(batch, self.device).items():
@@ -172,12 +174,22 @@ class Trainer:
         feats.update({f"{s}_idx": torch.tensor(fd[s]) for s in SPLITS})
         torch.save(feats, os.path.join(out, "features.pt"))
         print(f"[cache] {feats['y'].numel()} patients -> {os.path.join(out, 'features.pt')}")
+        # 各阶段使用的数据：
+        #   阶段 2 Anchor   : 输入 z_fs，监督 z_post
+        #   阶段 3 CPD      : 条件 [z_ct, z_fs, z_tab]，目标 r = z_post - z_anchor
+        #   阶段 4 GU-Gate  : 条件 [z_ct, z_fs, z_tab]，目标 r
+        #   阶段 5 CMAA     : [z_ct, z_fs, z_tab, 生成的 z_post_tilde]（不使用 z_post）
 
     # ==================================================================
     # 阶段二至五（缓存特征）
     # ==================================================================
+    def features_file(self, fold: int) -> str:
+        """阶段 1 缓存特征。train.features_dir 可指向另一次运行（消融实验复用同一套冻结编码器）"""
+        root = self.cfg.train.features_dir or self.log_dir
+        return os.path.join(root, f"fold_{fold}", "features.pt")
+
     def load_features(self, fold: int) -> Dict[str, Dict[str, torch.Tensor]]:
-        path = os.path.join(self.fold_dir(fold), "features.pt")
+        path = self.features_file(fold)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"{path} 不存在，请先运行阶段 1")
         f = torch.load(path, map_location=self.device)
@@ -234,11 +246,15 @@ class Trainer:
     def fit_stage(self, stage: int, fold: int):
         tc, out = self.cfg.train, self.fold_dir(fold)
         feats = self.load_features(fold)
+        tag = tc.run_tag
         model = URDP.from_fold(self.cfg.model, out, upto=stage - 1, device=self.device)
         opt, sched = make_optimizer(model.set_trainable(stage), tc)
         target = model.module(STAGE_MODULES[stage])
         mode = "max" if stage == 5 else "min"
-        keeper = BestKeeper(os.path.join(out, CKPT_NAMES[stage]), mode)
+        keeper = BestKeeper(os.path.join(out, ckpt_name(stage, tag)), mode)
+        track = tc.track_embeddings and stage in (2, 3)
+        if track:
+            self._save_reference(fold, feats["test"])
 
         for ep in range(1, tc.epochs + 1):
             target.train()
@@ -258,14 +274,16 @@ class Trainer:
             extra = (f" L_diff={val['diff_loss']:.4f} L_res={val['res_loss']:.4f}" if stage == 3
                      else f" | {fmt(val)}" if stage == 5 else "")
             print(f"[stage {stage}] ep{ep:02d} train loss={tot / n:.4f} | val loss={val['loss']:.4f}{extra}")
+            if track:
+                self._track_epoch(model, stage, fold, ep, feats["test"])
         print(f"[stage {stage}] best val {'acc' if stage == 5 else 'loss'}={keeper.best:.4f} @ epoch {keeper.epoch}")
 
-        model.load_stage(stage, out, map_location=self.device)
+        model.load_stage(stage, out, map_location=self.device, tag=tag)
         if stage == 3:
             # Analytic-DPM：在训练分区上估计 Γ_n，写回 checkpoint
             tr = feats["train"]
             with torch.no_grad():
-                r = tr["z_post"] - model.anchor(tr["z_fs"])
+                r = tr["z_post"] - model.base(tr["z_fs"])
             model.diffusion.estimate_gamma(model.condition(tr["z_ct"], tr["z_fs"], tr["z_tab"]), r)
             ck = torch.load(keeper.path, map_location="cpu")
             ck.update(model.state_for(3))
@@ -274,25 +292,57 @@ class Trainer:
         if stage == 5:
             self.test(model, fold, feats["test"])
 
+    # ------------------------------------------------------------------
+    # 可视化用的逐 epoch 嵌入（测试折，固定种子）
+    # ------------------------------------------------------------------
+    def _emb_dir(self, fold: int) -> str:
+        d = os.path.join(self.fold_dir(fold), "embeddings")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _save_reference(self, fold: int, feats: Dict):
+        torch.save({k: feats[k].cpu() for k in ("z_ct", "z_fs", "z_tab", "z_post", "y", "idx")},
+                   os.path.join(self._emb_dir(fold), "reference.pt"))
+
+    @torch.no_grad()
+    def _track_epoch(self, model: URDP, stage: int, fold: int, ep: int, feats: Dict, seed: int = 0):
+        """阶段 2 保存 z_anchor；阶段 3 另存 K 个残差候选 [K, N, d]"""
+        model.eval()
+        gen = make_generator(self.device, seed)
+        anchors, cands = [], []
+        for b in self._batches(feats, self.cfg.train.batch_size, False):
+            anchors.append(model.base(b["z_fs"]).cpu())
+            if stage == 3:
+                cands.append(model.diffusion.sample_k(
+                    model.condition(b["z_ct"], b["z_fs"], b["z_tab"]), self.cfg.model.K, generator=gen).cpu())
+        out = {"z_anchor": torch.cat(anchors).half()}
+        if stage == 3:
+            out["cands"] = torch.cat(cands, dim=1).half()
+        torch.save(out, os.path.join(self._emb_dir(fold), f"stage{stage}_ep{ep:03d}.pt"))
+
     def test(self, model: URDP, fold: int, feats: Dict):
         """held-out 测试折，只用最终选定的 checkpoint 评估一次。"""
         res = self._evaluate(model, 5, feats)
         names = self.cfg.data.class_names
         print(f"[fold {fold}] TEST {fmt(res)}\n{format_cm(res['cm'], names)}")
-        out = self.fold_dir(fold)
+        out, sfx = self.fold_dir(fold), self._sfx
         torch.save({"idx": feats["idx"].cpu(), "y": feats["y"].cpu(), "probs": res.pop("probs").cpu()},
-                   os.path.join(out, "test_predictions.pt"))
-        save_json({k: res[k] for k in KEYS + ("cm",)}, os.path.join(out, "test_metrics.json"))
+                   os.path.join(out, f"test_predictions{sfx}.pt"))
+        save_json({k: res[k] for k in KEYS + ("cm",)}, os.path.join(out, f"test_metrics{sfx}.json"))
+
+    @property
+    def _sfx(self) -> str:
+        return f"_{self.cfg.train.run_tag}" if self.cfg.train.run_tag else ""
 
     def summarize_internal(self):
         """五折测试指标 mean±std（Table I）+ pooled OOF 混淆矩阵（Fig.5(a)）"""
-        per_fold, ys, ps = [], [], []
+        per_fold, ys, ps, sfx = [], [], [], self._sfx
         for fold in range(1, self.cfg.train.n_folds + 1):
             d = os.path.join(self.log_dir, f"fold_{fold}")
-            if not os.path.isfile(os.path.join(d, "test_metrics.json")):
+            if not os.path.isfile(os.path.join(d, f"test_metrics{sfx}.json")):
                 continue
-            per_fold.append({"fold": fold, **load_json(os.path.join(d, "test_metrics.json"))})
-            pred = torch.load(os.path.join(d, "test_predictions.pt"))
+            per_fold.append({"fold": fold, **load_json(os.path.join(d, f"test_metrics{sfx}.json"))})
+            pred = torch.load(os.path.join(d, f"test_predictions{sfx}.pt"))
             ys.append(pred["y"].numpy())
             ps.append(pred["probs"].numpy())
         if not per_fold:
@@ -300,7 +350,8 @@ class Trainer:
         summary = {"per_fold": per_fold, **mean_std(per_fold)}
         summary["pooled_oof"] = classification_metrics(np.concatenate(ys), np.concatenate(ps),
                                                        self.cfg.model.num_classes)
-        save_json(summary, os.path.join(self.log_dir, "internal_summary.json"))
+        save_json(summary, os.path.join(self.log_dir, f"internal_summary{sfx}.json"))
         print_mean_std(f"Internal test ({len(per_fold)} folds, mean ± std)", summary)
         print("Pooled OOF confusion matrix:")
         print(format_cm(summary["pooled_oof"]["cm"], self.cfg.data.class_names))
+        return summary

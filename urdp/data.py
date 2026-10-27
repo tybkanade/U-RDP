@@ -36,6 +36,9 @@ def cat_cardinalities(dc: DataConfig) -> List[int]:
 
 class URDPDataset(Dataset):
     """
+    require_post=True（训练队列）时只保留术后 WSI 特征存在的患者，保证阶段 1-5 使用同一批患者、同一份划分；
+    推理/外部评估不需要术后病理。各阶段读取的模态不同，用 view() 取得只加载所需模态的视图。
+
     每个样本：
         CT        [1, T, H, W]  病灶中心 ROI，用 set_ct_stats 设定的训练集统计量标准化
         fs        [titan_dim]   术中冰冻切片 TITAN slide embedding
@@ -49,13 +52,11 @@ class URDPDataset(Dataset):
 
     def __init__(self, dc: DataConfig, excel: Optional[str] = None, fs_dir: Optional[str] = None,
                  post_dir: Optional[str] = None, with_labels: bool = True,
-                 load_ct: bool = True, load_post: bool = False, verbose: bool = True):
+                 require_post: bool = False, verbose: bool = True):
         self.dc = dc
         self.fs_dir = fs_dir or dc.fs_dir
         self.post_dir = post_dir or dc.post_dir
         self.with_labels = with_labels
-        self.load_ct = load_ct
-        self.load_post = load_post
         self.roi = tuple(dc.ct_roi)
         self.ct_stats: Optional[Tuple[float, float]] = None
         self.class_names = list(dc.class_names)
@@ -71,11 +72,23 @@ class URDPDataset(Dataset):
         df["__ct__"] = df[dc.ct_col].astype(str).str.strip()
         df["__fs__"] = df[dc.fs_id_col].map(lambda s: os.path.join(self.fs_dir, f"{s}.h5"))
         keep = df["__ct__"].map(os.path.isfile) & df["__fs__"].map(os.path.isfile)
+        n_ct, n_fs = int((~df["__ct__"].map(os.path.isfile)).sum()), int((~df["__fs__"].map(os.path.isfile)).sum())
+        n_label = n_post = 0
         if with_labels:
             df[dc.label_col] = df[dc.label_col].astype(str).str.strip()
-            keep &= df[dc.label_col].isin(self.class_names)
+            ok = df[dc.label_col].isin(self.class_names)
+            n_label = int((~ok).sum())
+            keep &= ok
+        if require_post:
+            if dc.post_prefix_col not in df.columns:
+                raise ValueError(f"患者表缺少列：{dc.post_prefix_col}")
+            ok = df[dc.post_prefix_col].map(lambda p: bool(glob.glob(
+                os.path.join(self.post_dir, str(p).strip(), "*.h5"))))
+            n_post = int((~ok).sum())
+            keep &= ok
         if verbose:
-            print(f"[URDPDataset] {len(df)} 行 -> 保留 {int(keep.sum())} 行（CT/FS 文件存在且标签合法）")
+            print(f"[URDPDataset] {len(df)} 行 -> 保留 {int(keep.sum())} 行 | 缺 CT {n_ct}，缺 FS {n_fs}，"
+                  f"非法标签 {n_label}" + (f"，缺术后 WSI {n_post}" if require_post else ""))
         self.df = df[keep].reset_index(drop=True)
         self._encode_table()
 
@@ -150,7 +163,13 @@ class URDPDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+    def view(self, load_ct: bool = True, load_post: bool = False) -> "DatasetView":
+        return DatasetView(self, load_ct, load_post)
+
     def __getitem__(self, idx: int) -> Dict:
+        return self.get(idx, load_ct=True, load_post=False)
+
+    def get(self, idx: int, load_ct: bool, load_post: bool) -> Dict:
         item = {
             "fs": torch.from_numpy(_read_h5_features(self.df.at[idx, "__fs__"])),
             "x_num": self.x_num[idx],
@@ -159,15 +178,35 @@ class URDPDataset(Dataset):
             "y": int(self.y[idx]),
             "index": idx,
         }
-        if self.load_ct:
+        if load_ct:
             if self.ct_stats is None:
                 raise RuntimeError("请先调用 set_ct_stats(mean, std)")
             m, s = self.ct_stats
             ct = (self.load_ct_raw(idx) - m) / (s + 1e-6)
             item["CT"] = torch.from_numpy(np.ascontiguousarray(ct))[None]
-        if self.load_post:
+        if load_post:
             item["post"] = self._post_list(idx)
         return item
+
+
+class DatasetView(Dataset):
+    """
+    同一患者集合上只加载指定模态的视图：
+        阶段 1 术中分支 view(load_ct=True, load_post=False)
+        阶段 1 术后分支 view(load_ct=False, load_post=True)
+        特征缓存       view(load_ct=True, load_post=True)
+        推理           view(load_ct=True, load_post=False)
+    """
+
+    def __init__(self, ds: URDPDataset, load_ct: bool, load_post: bool, indices: Optional[Sequence[int]] = None):
+        self.ds, self.load_ct, self.load_post = ds, load_ct, load_post
+        self.indices = list(range(len(ds))) if indices is None else list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i: int) -> Dict:
+        return self.ds.get(self.indices[i], self.load_ct, self.load_post)
 
 
 def collate(batch: List[Dict]) -> Dict:

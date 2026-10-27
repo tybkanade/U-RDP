@@ -25,6 +25,12 @@ STAGE_MODULES = {2: "anchor", 3: "cpd", 4: "gu_gate", 5: "cmaa"}
 CKPT_NAMES = {2: "stage2_anchor.pth", 3: "stage3_cpd.pth", 4: "stage4_gu_gate.pth", 5: "stage5_cmaa.pth"}
 
 
+def ckpt_name(stage: int, tag: str = "") -> str:
+    """run_tag 只作用于阶段 5（同一组阶段 1-4 结果上做不同 CMAA 配置的实验）"""
+    name = CKPT_NAMES[stage]
+    return name.replace(".pth", f"_{tag}.pth") if (tag and stage == 5) else name
+
+
 class URDP(nn.Module):
     def __init__(self, mc):
         super().__init__()
@@ -42,6 +48,14 @@ class URDP(nn.Module):
     def module(self, name: str) -> nn.Module:
         return self.diffusion.cpd if name == "cpd" else getattr(self, name)
 
+    @property
+    def residual(self) -> bool:
+        return self.mc.generation_target == "residual"
+
+    def base(self, z_fs) -> torch.Tensor:
+        """残差生成的基底：U-RDP 为 z_anchor；full-feature 消融为 0（直接生成 z_post）。"""
+        return self.anchor(z_fs) if self.residual else torch.zeros_like(z_fs)
+
     @staticmethod
     def condition(z_ct, z_fs, z_tab) -> torch.Tensor:
         return torch.stack([z_ct, z_fs, z_tab], dim=1)
@@ -55,7 +69,7 @@ class URDP(nn.Module):
 
     def cpd_loss(self, z_ct, z_fs, z_tab, z_post) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
-            r = z_post - self.anchor(z_fs)
+            r = z_post - self.base(z_fs)
         return self.diffusion.losses(r, self.condition(z_ct, z_fs, z_tab))
 
     def gu_gate_loss(self, gen: Dict[str, torch.Tensor], z_post):
@@ -65,7 +79,7 @@ class URDP(nn.Module):
     def generate(self, z_ct, z_fs, z_tab, K: Optional[int] = None, generator: Optional[torch.Generator] = None):
         """Anchor 与 CPD 不求梯度；GU-Gate 保留梯度。"""
         with torch.no_grad():
-            z_anchor = self.anchor(z_fs)
+            z_anchor = self.base(z_fs)
             cands = self.diffusion.sample_k(self.condition(z_ct, z_fs, z_tab), K or self.mc.K, generator=generator)
         gate = self.gu_gate(cands)
         return {"z_anchor": z_anchor, "cands": cands, "z_post_tilde": z_anchor + gate["r_tilde"], **gate}
@@ -89,6 +103,11 @@ class URDP(nn.Module):
         target.requires_grad_(True).train()
         return list(target.parameters())
 
+    @staticmethod
+    def stages_needed(mc, upto: int):
+        """full-feature 消融不训练 Anchor（阶段 2）。"""
+        return [s for s in range(2, upto + 1) if not (s == 2 and mc.generation_target != "residual")]
+
     def state_for(self, stage: int) -> Dict:
         state = {"module": self.module(STAGE_MODULES[stage]).state_dict()}
         if stage == 3:
@@ -96,8 +115,8 @@ class URDP(nn.Module):
             state["gamma_ready"] = bool(self.diffusion.gamma_ready)
         return state
 
-    def load_stage(self, stage: int, fold_dir: str, map_location="cpu"):
-        ck = torch.load(os.path.join(fold_dir, CKPT_NAMES[stage]), map_location=map_location)
+    def load_stage(self, stage: int, fold_dir: str, map_location="cpu", tag: str = ""):
+        ck = torch.load(os.path.join(fold_dir, ckpt_name(stage, tag)), map_location=map_location)
         self.module(STAGE_MODULES[stage]).load_state_dict(ck["module"])
         if stage == 3 and ck.get("gamma_ready"):
             self.diffusion.gamma.copy_(ck["gamma"])
@@ -105,8 +124,8 @@ class URDP(nn.Module):
         return ck
 
     @classmethod
-    def from_fold(cls, mc, fold_dir: str, upto: int = 5, device="cpu") -> "URDP":
+    def from_fold(cls, mc, fold_dir: str, upto: int = 5, device="cpu", tag: str = "") -> "URDP":
         model = cls(mc).to(device)
-        for s in range(2, upto + 1):
-            model.load_stage(s, fold_dir, map_location=device)
+        for s in cls.stages_needed(mc, upto):
+            model.load_stage(s, fold_dir, map_location=device, tag=tag)
         return model.eval()
