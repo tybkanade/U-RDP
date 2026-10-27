@@ -1,0 +1,49 @@
+# U-RDP 默认配置。未列出的字段使用 urdp/config.py 中的默认值。
+data:
+  excel: /path/to/patients.xlsx               # 每行一位患者
+  fs_dir: /path/to/frozen_section/titan        # <fs_dir>/<冰冻切片号>.h5，键 "features" 为 768 维 TITAN slide embedding
+  post_dir: /path/to/postoperative/titan       # <post_dir>/<术后病理前缀>/*.h5（仅训练需要）
+  ct_col: __npy_path__                         # 病灶中心 CT .npy，形状 (H, W, D)
+  fs_id_col: 冰冻切片号
+  post_prefix_col: 术后病理前缀
+  label_col: 术后病理诊断类型
+  class_names: [AAH/AIS, MIA, AC]
+  num_cols: [年龄, 长径cm, 短径cm, 实性成分长径]
+  binary_cols: [圆形、类圆形, 不规则, 分叶, 结节征, 空泡, 空洞, 钙化, 支气管征,
+                清楚, 光滑锐利, 毛刺, 尖角、桃尖, 索条, 血管集束征, 胸膜凹陷]
+  density_col: 密度
+  pleura_col: 与胸膜的关系
+  gender_col: 性别
+  ct_roi: [33, 51, 51]
+
+model:
+  d: 768
+  lambda_a: 0.3
+  lambda_b: 0.4
+  lambda_c: 0.2
+  lambda_d: 0.3
+  sq_norm_reduction: mean
+  timesteps: 100
+  sample_steps: 64
+  cpd_layers: 8
+  cpd_hidden: 1024
+  cpd_heads: 16
+  cpd_ffn: 4096
+  cpd_dropout: 0.2
+  K: 6
+  cmaa_layers: 4
+  cmaa_heads: 8
+  focal_gamma: 2.0
+
+train:
+  log_dir: runs/urdp
+  n_folds: 5
+  seed: 42
+  device: auto
+  num_workers: 8
+  lr: 1.0e-5
+  weight_decay: 5.0e-5
+  epochs: 60
+  warmup_epochs: 5
+  batch_size_pretrain: 8
+  batch_size: 32
