@@ -108,8 +108,11 @@ def cosine_alpha_bar(T: int, s: float = 0.008) -> torch.Tensor:
 class ResidualDiffusion(nn.Module):
     def __init__(self, cpd: CPD, T: int = 100, sample_steps: int = 64,
                  lambda_b: float = 0.4, lambda_c: float = 0.2,
-                 eps_num: float = 1e-8, sq_norm_reduction: str = "mean"):
+                 eps_num: float = 1e-8, sq_norm_reduction: str = "mean",
+                 residual_norm: bool = False, min_snr_gamma: float = 0.0):
         super().__init__()
+        self.residual_norm = residual_norm
+        self.min_snr_gamma = min_snr_gamma
         self.cpd = cpd
         self.T = T
         self.sample_steps = sample_steps
@@ -123,6 +126,24 @@ class ResidualDiffusion(nn.Module):
         # Analytic-DPM：Γ_n = E‖ε_θ(x_n,n)‖² / d，训练后由 estimate_gamma 估计
         self.register_buffer("gamma", torch.ones(T + 1))
         self.register_buffer("gamma_ready", torch.tensor(False))
+        # 可选的残差标准化统计量（residual_norm=True 时由 set_residual_stats 在训练分区上设置）
+        d = cpd.r_in.in_features
+        self.register_buffer("r_mean", torch.zeros(d))
+        self.register_buffer("r_std", torch.ones(d))
+
+    # ---------------- 残差标准化（可选）----------------
+    @torch.no_grad()
+    def set_residual_stats(self, r_train: torch.Tensor):
+        """训练分区残差的逐维均值/标准差；residual_norm=False 时保持恒等变换。"""
+        if self.residual_norm:
+            self.r_mean.copy_(r_train.float().mean(0))
+            self.r_std.copy_(r_train.float().std(0).clamp_min(1e-4))
+
+    def _norm(self, r):
+        return (r - self.r_mean) / self.r_std if self.residual_norm else r
+
+    def _denorm(self, x):
+        return x * self.r_std + self.r_mean if self.residual_norm else x
 
     # ---------------- 工具 ----------------
     def _coef(self, t: torch.Tensor):
@@ -137,15 +158,21 @@ class ResidualDiffusion(nn.Module):
         L_CPD = λc L_diff + (1-λc) L_res
         """
         B = r.size(0)
+        x0 = self._norm(r)                           # residual_norm=False 时 x0 = r
         t = torch.randint(1, self.T + 1, (B,), device=r.device)
-        eps = torch.randn_like(r)
+        eps = torch.randn_like(x0)
         sa, s1a = self._coef(t)
-        r_t = sa * r + s1a * eps                     # Eq.4
-        v = sa * eps - s1a * r                       # Eq.5
-        v_hat = self.cpd(r_t, t, cond)
-        sq = (v_hat.float() - v).pow(2)
-        l_diff = (sq.sum(-1) if self.sq_norm_reduction == "sum" else sq.mean(-1)).mean()
-        r0_hat = sa * r_t - s1a * v_hat              # Eq.6
+        r_t = sa * x0 + s1a * eps                    # Eq.4
+        v = sa * eps - s1a * x0                      # Eq.5
+        v_hat = self.cpd(r_t, t, cond).float()
+        sq = (v_hat - v).pow(2)
+        sq = sq.sum(-1) if self.sq_norm_reduction == "sum" else sq.mean(-1)
+        if self.min_snr_gamma > 0:
+            # min-SNR-γ（Hang et al., 2023）在 v 参数化下的权重：min(SNR, γ) / (SNR + 1)
+            snr = self.abar[t] / (1 - self.abar[t])
+            sq = sq * snr.clamp(max=self.min_snr_gamma) / (snr + 1)
+        l_diff = sq.mean()
+        r0_hat = self._denorm(sa * r_t - s1a * v_hat)   # Eq.6，还原到原始残差尺度后计算 L_res
         l_res = align_loss(r0_hat, r, self.lambda_b, self.eps_num, self.sq_norm_reduction)
         l_cpd = self.lambda_c * l_diff + (1 - self.lambda_c) * l_res
         return {"loss": l_cpd, "diff_loss": l_diff, "res_loss": l_res, "r0_hat": r0_hat}
@@ -167,7 +194,7 @@ class ResidualDiffusion(nn.Module):
             acc, cnt = 0.0, 0
             for _ in range(n_rep):
                 for i in range(0, r_all.size(0), batch_size):
-                    r = r_all[i:i + batch_size].to(device)
+                    r = self._norm(r_all[i:i + batch_size].to(device))
                     c = cond_all[i:i + batch_size].to(device)
                     t = torch.full((r.size(0),), n, device=device, dtype=torch.long)
                     sa, s1a = self._coef(t)
@@ -219,7 +246,7 @@ class ResidualDiffusion(nn.Module):
                 sigma2 = lam2
             noise = torch.randn(B, d, device=device, generator=generator)
             x = mean + sigma2.sqrt() * noise
-        return x
+        return self._denorm(x)
 
     @torch.no_grad()
     def sample_k(self, cond: torch.Tensor, K: int, steps: Optional[int] = None,

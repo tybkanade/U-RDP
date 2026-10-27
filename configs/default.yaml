@@ -3,7 +3,8 @@ data:
   excel: /path/to/patients.xlsx               # 每行一位患者
   fs_dir: /path/to/frozen_section/titan        # <fs_dir>/<冰冻切片号>.h5，键 "features" 为 768 维 TITAN slide embedding
   post_dir: /path/to/postoperative/titan       # <post_dir>/<术后病理前缀>/*.h5（仅训练需要）
-  ct_col: __npy_path__                         # 病灶中心 CT .npy，形状 (H, W, D)
+  ct_col: __npy_path__                         # 病灶中心 CT .npy（1.25 mm 轴向间距）
+  ct_layout: THW                               # .npy 轴顺序：THW=(层,高,宽)，HWT=(高,宽,层)；以病灶为中心裁剪到 ct_roi
   fs_id_col: 冰冻切片号
   post_prefix_col: 术后病理前缀
   label_col: 术后病理诊断类型
@@ -47,3 +48,4 @@ train:
   warmup_epochs: 5
   batch_size_pretrain: 8
   batch_size: 32
+  keep_topk: 2                # 每个模块只保留验证指标最好的 2 个 checkpoint（第 2 名为 *_top2.pth）

@@ -9,6 +9,7 @@ U-RDP 分阶段训练（每折独立，后一阶段冻结前面所有模块）
     阶段 4  GU-Gate               L_GU-Gate  = L_align(r̃, r; λd)（K 次采样，CPD 冻结）
     阶段 5  CMAA + 分类头          Focal loss；最终在 held-out 测试折上评估
 """
+import contextlib
 import os
 from typing import Dict, Iterable
 
@@ -24,7 +25,7 @@ from urdp.losses import FocalLoss
 from urdp.metrics import KEYS, classification_metrics, fmt, format_cm, mean_std, print_mean_std
 from urdp.models.encoders import IntraEncoder, MLPHead, PostEncoder
 from urdp.models.framework import STAGE_MODULES, URDP, ckpt_name
-from urdp.utils import BestKeeper, freeze, load_json, make_generator, make_optimizer, save_json, set_seed
+from urdp.utils import EMA, BestKeeper, append_jsonl, autocast, freeze, load_json, make_generator, make_optimizer, save_json, set_seed
 
 SPLITS = ("train", "val", "test")
 
@@ -64,6 +65,10 @@ class Trainer:
         self._ds = None
         self._folds = None
         self._focal = FocalLoss(cfg.model.focal_gamma)
+
+    def _amp(self):
+        """混合精度上下文（train.amp），只加速、不改变方法。"""
+        return autocast(self.device, self.cfg.train.amp)
 
     # ------------------------------------------------------------------
     @property
@@ -115,8 +120,9 @@ class Trainer:
         with torch.set_grad_enabled(opt is not None):
             for batch in tqdm(loader, leave=False):
                 y = batch["y"].to(self.device)
-                logits = model(batch, self.device)
-                loss = crit(logits, y)
+                with self._amp():
+                    logits = model(batch, self.device)
+                loss = crit(logits.float(), y)
                 if opt is not None:
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
@@ -143,7 +149,7 @@ class Trainer:
             opt, sched = make_optimizer(model.parameters(), tc)
             tl = self._loader(fd["train"], True, load_ct, load_post)
             vl = self._loader(fd["val"], False, load_ct, load_post)
-            keeper = BestKeeper(os.path.join(out, f"stage1_{branch}.pth"), "max")
+            keeper = BestKeeper(os.path.join(out, f"stage1_{branch}.pth"), "max", tc.keep_topk)
             for ep in range(1, tc.epochs + 1):
                 tr = self._run_epoch(model, tl, crit, opt)
                 va = self._run_epoch(model, vl, crit)
@@ -165,9 +171,11 @@ class Trainer:
         loader = self._loader(None, False, True, True)
         feats = {k: [] for k in ("z_ct", "z_fs", "z_tab", "z_post", "y")}
         for batch in tqdm(loader, desc="cache features"):
-            for k, v in intra(batch, self.device).items():
+            with self._amp():
+                z_intra, z_post = intra(batch, self.device), post(batch, self.device)
+            for k, v in z_intra.items():
                 feats[k].append(v.float().cpu())
-            feats["z_post"].append(post(batch, self.device).float().cpu())
+            feats["z_post"].append(z_post.float().cpu())
             feats["y"].append(batch["y"])
         feats = {k: torch.cat(v) for k, v in feats.items()}
         fd = self.folds[fold - 1]
@@ -229,7 +237,8 @@ class Trainer:
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(seed)
             for b in self._batches(feats, self.cfg.train.batch_size, False):
-                out = self._stage_loss(model, stage, b, generator=gen)
+                with self._amp():
+                    out = self._stage_loss(model, stage, b, generator=gen)
                 for k in ("loss", "diff_loss", "res_loss"):
                     if k in out:
                         tot[k] = tot.get(k, 0.0) + float(out[k]) * b["y"].numel()
@@ -250,32 +259,53 @@ class Trainer:
         model = URDP.from_fold(self.cfg.model, out, upto=stage - 1, device=self.device)
         opt, sched = make_optimizer(model.set_trainable(stage), tc)
         target = model.module(STAGE_MODULES[stage])
+        if stage == 3:
+            # 可选的残差标准化：统计量只用训练分区（model.residual_norm=False 时为恒等变换）
+            tr = feats["train"]
+            with torch.no_grad():
+                model.diffusion.set_residual_stats(tr["z_post"] - model.base(tr["z_fs"]))
+        # 可选的 EMA：仅阶段 3 的 CPD
+        ema = EMA(target, self.cfg.model.ema_decay) if (stage == 3 and self.cfg.model.ema_decay > 0) else None
         mode = "max" if stage == 5 else "min"
-        keeper = BestKeeper(os.path.join(out, ckpt_name(stage, tag)), mode)
+        keeper = BestKeeper(os.path.join(out, ckpt_name(stage, tag)), mode, tc.keep_topk)
+        history = os.path.join(out, f"history_stage{stage}{self._sfx if stage == 5 else ''}.jsonl")
+        if os.path.isfile(history):
+            os.remove(history)
         track = tc.track_embeddings and stage in (2, 3)
         if track:
             self._save_reference(fold, feats["test"])
 
         for ep in range(1, tc.epochs + 1):
             target.train()
-            tot, n = 0.0, 0
+            tot, n, skipped = 0.0, 0, 0
             for b in self._batches(feats["train"], tc.batch_size, True):
-                loss = self._stage_loss(model, stage, b)["loss"]
+                with self._amp():
+                    loss = self._stage_loss(model, stage, b)["loss"]
+                if not torch.isfinite(loss):
+                    skipped += 1          # 数值异常的 batch 直接跳过（旧版 NaNGuard）
+                    continue
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(target.parameters(), tc.grad_clip)
                 opt.step()
+                if ema is not None:
+                    ema.update()
                 tot += float(loss) * b["y"].numel()
                 n += b["y"].numel()
             sched.step()
-            val = self._evaluate(model, stage, feats["val"])
-            score = val["acc"] if stage == 5 else val["loss"]
-            keeper.update(score, ep, {"epoch": ep, "val_score": score, **model.state_for(stage)})
+            # 验证与保存：启用 EMA 时用 EMA 权重
+            with (ema.apply() if ema is not None else contextlib.nullcontext()):
+                val = self._evaluate(model, stage, feats["val"])
+                score = val["acc"] if stage == 5 else val["loss"]
+                keeper.update(score, ep, {"epoch": ep, "val_score": score, **model.state_for(stage)})
+                if track:
+                    self._track_epoch(model, stage, fold, ep, feats["test"])
             extra = (f" L_diff={val['diff_loss']:.4f} L_res={val['res_loss']:.4f}" if stage == 3
                      else f" | {fmt(val)}" if stage == 5 else "")
-            print(f"[stage {stage}] ep{ep:02d} train loss={tot / n:.4f} | val loss={val['loss']:.4f}{extra}")
-            if track:
-                self._track_epoch(model, stage, fold, ep, feats["test"])
+            warn = f" (跳过 {skipped} 个非有限 batch)" if skipped else ""
+            print(f"[stage {stage}] ep{ep:02d} train loss={tot / max(n, 1):.4f} | val loss={val['loss']:.4f}{extra}{warn}")
+            append_jsonl({"epoch": ep, "train_loss": tot / max(n, 1), "lr": opt.param_groups[0]["lr"],
+                          **{k: v for k, v in val.items() if k not in ("probs", "cm")}}, history)
         print(f"[stage {stage}] best val {'acc' if stage == 5 else 'loss'}={keeper.best:.4f} @ epoch {keeper.epoch}")
 
         model.load_stage(stage, out, map_location=self.device, tag=tag)
@@ -284,7 +314,8 @@ class Trainer:
             tr = feats["train"]
             with torch.no_grad():
                 r = tr["z_post"] - model.base(tr["z_fs"])
-            model.diffusion.estimate_gamma(model.condition(tr["z_ct"], tr["z_fs"], tr["z_tab"]), r)
+            with self._amp():
+                model.diffusion.estimate_gamma(model.condition(tr["z_ct"], tr["z_fs"], tr["z_tab"]), r)
             ck = torch.load(keeper.path, map_location="cpu")
             ck.update(model.state_for(3))
             torch.save(ck, keeper.path)
@@ -313,8 +344,10 @@ class Trainer:
         for b in self._batches(feats, self.cfg.train.batch_size, False):
             anchors.append(model.base(b["z_fs"]).cpu())
             if stage == 3:
-                cands.append(model.diffusion.sample_k(
-                    model.condition(b["z_ct"], b["z_fs"], b["z_tab"]), self.cfg.model.K, generator=gen).cpu())
+                with self._amp():
+                    c = model.diffusion.sample_k(model.condition(b["z_ct"], b["z_fs"], b["z_tab"]),
+                                                 self.cfg.model.K, generator=gen)
+                cands.append(c.float().cpu())
         out = {"z_anchor": torch.cat(anchors).half()}
         if stage == 3:
             out["cands"] = torch.cat(cands, dim=1).half()

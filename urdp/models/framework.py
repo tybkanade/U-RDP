@@ -40,6 +40,7 @@ class URDP(nn.Module):
             CPD(mc.d, mc.cpd_hidden, mc.cpd_layers, mc.cpd_heads, mc.cpd_ffn, mc.cpd_dropout, mc.cpd_time_dim),
             T=mc.timesteps, sample_steps=mc.sample_steps, lambda_b=mc.lambda_b, lambda_c=mc.lambda_c,
             eps_num=mc.eps_num, sq_norm_reduction=mc.sq_norm_reduction,
+            residual_norm=mc.residual_norm, min_snr_gamma=mc.min_snr_gamma,
         )
         self.gu_gate = GUGate(mc.d)
         self.cmaa = CMAA(mc.d, mc.cmaa_heads, mc.cmaa_layers, mc.cmaa_score_hidden,
@@ -111,16 +112,23 @@ class URDP(nn.Module):
     def state_for(self, stage: int) -> Dict:
         state = {"module": self.module(STAGE_MODULES[stage]).state_dict()}
         if stage == 3:
+            # CPD 之外、推理必需的扩散状态：Analytic-DPM Γ 与（可选）残差标准化统计量
             state["gamma"] = self.diffusion.gamma.cpu()
             state["gamma_ready"] = bool(self.diffusion.gamma_ready)
+            state["r_mean"] = self.diffusion.r_mean.cpu()
+            state["r_std"] = self.diffusion.r_std.cpu()
         return state
 
     def load_stage(self, stage: int, fold_dir: str, map_location="cpu", tag: str = ""):
         ck = torch.load(os.path.join(fold_dir, ckpt_name(stage, tag)), map_location=map_location)
         self.module(STAGE_MODULES[stage]).load_state_dict(ck["module"])
-        if stage == 3 and ck.get("gamma_ready"):
-            self.diffusion.gamma.copy_(ck["gamma"])
-            self.diffusion.gamma_ready.fill_(True)
+        if stage == 3:
+            if ck.get("gamma_ready"):
+                self.diffusion.gamma.copy_(ck["gamma"])
+                self.diffusion.gamma_ready.fill_(True)
+            if "r_mean" in ck:
+                self.diffusion.r_mean.copy_(ck["r_mean"])
+                self.diffusion.r_std.copy_(ck["r_std"])
         return ck
 
     @classmethod

@@ -145,7 +145,9 @@ class URDPDataset(Dataset):
 
     def load_ct_raw(self, idx: int) -> np.ndarray:
         """裁剪后、未标准化的 CT (T, H, W)。"""
-        vol = np.moveaxis(np.load(self.df.at[idx, "__ct__"]).astype(np.float32), -1, 0)
+        vol = np.load(self.df.at[idx, "__ct__"]).astype(np.float32)
+        if self.dc.ct_layout == "HWT":           # (H, W, T) -> (T, H, W)
+            vol = np.moveaxis(vol, -1, 0)
         sl = []
         for n, r in zip(vol.shape, self.roi):
             if n < r:

@@ -12,7 +12,8 @@ class DataConfig:
     excel: str = ""                       # 患者表（每行一位患者）
     fs_dir: str = ""                      # 术中冰冻切片 TITAN 特征目录：<fs_dir>/<冰冻切片号>.h5
     post_dir: str = ""                    # 术后 WSI TITAN 特征根目录：<post_dir>/<术后病理前缀>/*.h5
-    ct_col: str = "__npy_path__"          # 病灶中心 CT 体积 .npy 路径列，形状 (H, W, D)
+    ct_col: str = "__npy_path__"          # 病灶中心 CT 体积 .npy 路径列（已重采样到 1.25 mm 轴向间距）
+    ct_layout: str = "THW"                # .npy 轴顺序："THW"=(层, 高, 宽)；"HWT"=(高, 宽, 层)
     fs_id_col: str = "冰冻切片号"
     post_prefix_col: str = "术后病理前缀"
     label_col: str = "术后病理诊断类型"
@@ -64,6 +65,10 @@ class ModelConfig:
     cpd_ffn: int = 4096
     cpd_dropout: float = 0.2
     cpd_time_dim: int = 256
+    # ---- 从旧版生成器沿用的可选项（默认关闭 = 与论文一致）----
+    residual_norm: bool = False     # 用训练分区残差的逐维均值/方差标准化后再扩散，采样后还原
+    min_snr_gamma: float = 0.0      # >0 时对 L_diff 使用 min-SNR-γ 加权（旧版 γ=4）；0 为论文的等权
+    ema_decay: float = 0.0          # >0 时对阶段 3 的 CPD 维护 EMA 权重，验证/保存/推理都用 EMA（旧版常用 0.999）
     # 生成目标："residual"（U-RDP：r = z_post - z_anchor）| "full"（消融：直接生成 z_post，不用 Anchor）
     generation_target: str = "residual"
     # Multi-sampling + GU-Gate
@@ -91,6 +96,8 @@ class TrainConfig:
     batch_size_pretrain: int = 8    # 阶段一（原始影像）
     batch_size: int = 32            # 阶段二至五（缓存特征）
     grad_clip: float = 1.0
+    keep_topk: int = 2              # 每个模块只保留验证指标最好的前 k 个 checkpoint
+    amp: str = "bf16"               # 混合精度："bf16" | "fp16" | "none"（只影响速度，不改变方法；仅 CUDA 生效）
     # 阶段 2/3 每个 epoch 在测试折上保存生成嵌入（Fig.4 UMAP、Fig.6 MMD 用）
     track_embeddings: bool = False
     # 阶段 5 输出文件后缀（如 CMAA 深度敏感性实验 "L4"），不同 tag 共用阶段 1-4 结果

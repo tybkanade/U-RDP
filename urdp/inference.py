@@ -15,7 +15,7 @@ from urdp.config import Config
 from urdp.data import URDPDataset, collate
 from urdp.models.framework import URDP
 from urdp.trainer import build_intra_encoder
-from urdp.utils import freeze, load_json, make_generator
+from urdp.utils import autocast, freeze, load_json, make_generator
 
 
 class FoldPredictor:
@@ -23,6 +23,7 @@ class FoldPredictor:
 
     def __init__(self, cfg: Config, fold_dir: str, device: str):
         self.device = device
+        self.amp = cfg.train.amp
         self.ct_stats = load_json(os.path.join(fold_dir, "ct_stats.json"))
         enc = build_intra_encoder(cfg)
         enc.load_state_dict(torch.load(os.path.join(fold_dir, "stage1_intra.pth"), map_location="cpu")["encoder"])
@@ -36,8 +37,10 @@ class FoldPredictor:
         gen = make_generator(self.device, seed)
         probs, unc, idx = [], [], []
         for batch in tqdm(loader, leave=False):
-            z = self.encoder(batch, self.device)
-            out = self.model.predict(z["z_ct"], z["z_fs"], z["z_tab"], generator=gen)
+            with autocast(self.device, self.amp):
+                z = self.encoder(batch, self.device)
+                z = {k: v.float() for k, v in z.items()}
+                out = self.model.predict(z["z_ct"], z["z_fs"], z["z_tab"], generator=gen)
             probs.append(out["probs"].cpu())
             unc.append(out["uncertainty"].float().cpu())
             idx.append(batch["index"])
